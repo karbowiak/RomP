@@ -2,7 +2,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: romp\n"
 "Report-Msgid-Bugs-To: \n"
-"PO-Revision-Date: 2026-10-31 16:02\n"
+"PO-Revision-Date: 2026-11-05 14:31\n"
 "Last-Translator: \n"
 "Language-Team: French\n"
 "Language: fr_FR\n"
@@ -207,6 +207,14 @@ msgstr "{name} n'a pas de téléchargement pour cet ordinateur"
 #: crates/romp-app/src/app/game.rs
 msgid "Installing the PS3 system software…"
 msgstr "Installation du logiciel système PS3…"
+
+#: crates/romp-app/src/app/game.rs
+msgid "You're offline, so this version doesn't become your main one."
+msgstr ""
+
+#: crates/romp-app/src/app/game.rs
+msgid "Couldn't make this your main version: {e}."
+msgstr ""
 
 #: crates/romp-app/src/app/game.rs
 msgid "Could not start the game: {e}"
@@ -710,6 +718,10 @@ msgstr "Jouer ou télécharger"
 msgid "Favorite"
 msgstr "Favoris"
 
+#: crates/romp-app/src/app/navigation.rs
+msgid "Change version"
+msgstr ""
+
 #: crates/romp-app/src/app/navigation.rs crates/romp-app/src/pad_labels.rs
 msgid "Back"
 msgstr "Précédent"
@@ -941,6 +953,10 @@ msgstr "Franchise"
 #: crates/romp-app/src/details.rs
 msgid "Rating"
 msgstr "Évaluation"
+
+#: crates/romp-app/src/details.rs
+msgid "Version"
+msgstr ""
 
 #: crates/romp-app/src/details.rs
 msgid "Size"
