@@ -121,6 +121,8 @@ struct Controller {
     other_save: RefCell<Option<(i64, crate::saves::OtherSave)>>,
     playing: RefCell<Option<crate::store::GameDetail>>,
     syncing_game: Cell<Option<i64>>,
+    save_retry: RefCell<Option<Timer>>,
+    save_task: RefCell<Option<tokio::task::JoinHandle<()>>>,
     downloaded_choice: Cell<bool>,
     icon_requests: RefCell<HashSet<String>>,
     running: RefCell<Option<crate::play::RunningGame>>,
@@ -232,6 +234,8 @@ pub fn run() -> anyhow::Result<()> {
         other_save: RefCell::new(None),
         playing: RefCell::new(None),
         syncing_game: Cell::new(None),
+        save_retry: RefCell::new(None),
+        save_task: RefCell::new(None),
         downloaded_choice: Cell::new(false),
         icon_requests: RefCell::default(),
         running: RefCell::new(None),
@@ -307,6 +311,7 @@ pub fn run() -> anyhow::Result<()> {
     slint::run_event_loop()?;
     controller.save_session();
     ui.hide()?;
+    controller.finish_save_sync();
     CONTROLLER.with(|c| c.borrow_mut().take());
     Ok(())
 }
@@ -447,6 +452,7 @@ impl Controller {
         self.send_pending_unlocks();
         self.check_for_updates();
         self.start_notifications();
+        self.start_save_retry();
         let server = self.shared.store.lock().unwrap().get("server");
         let token = server.as_deref().and_then(|s| self.shared.tokens.load(s));
         match (server.as_deref().map(url::Url::parse), token) {

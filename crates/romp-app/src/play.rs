@@ -78,6 +78,17 @@ pub enum RunningGame {
 }
 
 impl RunningGame {
+    /// Finish a libretro session before the app shuts down, so its final save reaches disk.
+    pub fn stop_core(&self) -> bool {
+        match self {
+            Self::Core(core) => {
+                (core.game.finish)();
+                self.wait_exit(Duration::from_secs(4))
+            }
+            Self::External(_) => false,
+        }
+    }
+
     pub fn wait_exit(&self, timeout: Duration) -> bool {
         match self {
             Self::Core(core) => core.game.session.borrow().wait_exit(timeout),

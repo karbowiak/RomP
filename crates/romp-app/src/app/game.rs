@@ -10,7 +10,7 @@ use crate::play::{self, CoreIdentity, GameOptions};
 use crate::restore::{game_window_key, Placement};
 use crate::romm::client::Error;
 use crate::rpcs3;
-use crate::saves::{self, SramOutcome};
+use crate::saves::SramOutcome;
 use crate::store::GameDetail;
 use crate::xemu::{self, Xemu};
 use crate::{GameCard, Shot};
@@ -139,6 +139,7 @@ impl Controller {
         self.load_screenshots(&detail, offset);
         self.load_game_achievements(&detail);
         self.show_save_slots(&detail);
+        self.refresh_game_saves();
         self.load_play_stats(id);
         self.load_similar(id);
     }
@@ -570,7 +571,7 @@ impl Controller {
             ui.set_game_status(tr!("A game is already running.").into());
             return;
         }
-        if self.syncing_game.get() == Some(detail.id) {
+        if self.syncing_game.get().is_some() {
             ui.set_game_status(tr!("Still syncing your saves. Try again in a moment.").into());
             return;
         }
@@ -659,13 +660,34 @@ impl Controller {
             }
             let sram = match (&client, sync) {
                 (Some(client), Some((device, game))) => {
-                    on_ui(move |c| c.game_status(id, tr!("Syncing your save…")));
-                    let last = store.lock().unwrap().in_game_save_record(game.rom_id);
-                    let result = saves::sync_sram(client, &device, &game, last.as_ref()).await;
-                    if let Ok(outcome) = &result {
-                        saves::remember_outcome(&store, &game, outcome);
-                    }
-                    Some(result)
+                    on_ui(move |c| c.game_status(id, tr!("Syncing your saves…")));
+                    Some(
+                        async {
+                            let version = if crate::cores::saves_states(core.id) {
+                                let path =
+                                    core_path.as_ref().map_err(|e| Error::Decode(e.clone()))?;
+                                let version = crate::session::core_version(path)
+                                    .await
+                                    .map_err(|e| Error::Decode(format!("{e:#}")))?;
+                                store
+                                    .lock()
+                                    .unwrap()
+                                    .set(&super::save_sync::version_key(id), &version);
+                                Some(version)
+                            } else {
+                                None
+                            };
+                            super::save_sync::sync_game(
+                                client,
+                                &store,
+                                &device,
+                                &game,
+                                version.as_deref(),
+                            )
+                            .await
+                        }
+                        .await,
+                    )
                 }
                 _ => None,
             };
@@ -1034,7 +1056,14 @@ impl Controller {
                     conflict,
                 });
             }
-            Some(Err(e)) => tracing::warn!("save sync before launch: {e}"),
+            Some(Err(e)) => {
+                tracing::warn!("save sync before launch: {e}");
+                self.preparing.set(false);
+                return self.game_status(
+                    detail.id,
+                    tr!("Couldn't sync saves: {e}. Try again before playing.", e),
+                );
+            }
             _ => {}
         }
         self.start_game(detail, rom, jit, core);
@@ -1176,6 +1205,8 @@ impl Controller {
         };
         match play::launch(options, on_closed, open_controllers) {
             Ok(running) => {
+                // If the app exits before the post-session upload finishes, retry next time.
+                self.shared.store.lock().unwrap().add_pending(detail.id);
                 *self.running.borrow_mut() = Some(running);
                 self.game_status(detail.id, String::new());
                 self.record_play(detail.id);
@@ -1189,6 +1220,16 @@ impl Controller {
     }
 
     fn game_closed(&self, identity: Option<CoreIdentity>) {
+        // The close callback requests shutdown; the runner writes SRAM and the automatic state
+        // afterwards. Keep polling without blocking the UI until those writes have completed.
+        if self.running.borrow().as_ref().is_some_and(|game| {
+            matches!(game, play::RunningGame::Core(_)) && !game.wait_exit(std::time::Duration::ZERO)
+        }) {
+            slint::Timer::single_shot(std::time::Duration::from_millis(20), move || {
+                with_controller(|c| c.game_closed(identity));
+            });
+            return;
+        }
         self.running.borrow_mut().take();
         self.end_session();
         self.pump_installs();

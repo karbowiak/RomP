@@ -19,6 +19,27 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const STOP_GRACE: Duration = Duration::from_secs(3);
 const WRITE_TIMEOUT: Duration = Duration::from_millis(50);
 
+/// Find the installed core's actual version before selecting a cloud state, including on the
+/// first launch and after a core update. Loading native code remains in a separate process.
+pub async fn core_version(core: &Path) -> Result<String> {
+    let mut command = tokio::process::Command::new(crate::paths::runner_exe()?);
+    command.arg("--core-version").arg(core).kill_on_drop(true);
+    #[cfg(windows)]
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+    let output = tokio::time::timeout(CONNECT_TIMEOUT, command.output())
+        .await
+        .context("reading the core version timed out")??;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "could not read the core version: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let version = String::from_utf8(output.stdout)?.trim().to_owned();
+    anyhow::ensure!(!version.is_empty(), "the core returned no version");
+    Ok(version)
+}
+
 pub struct SessionConfig {
     /// The game's name, for the lines that mark where it starts and ends in the log.
     pub title: String,
@@ -200,13 +221,16 @@ impl Session {
 
     pub fn wait_exit(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
+        loop {
             if !matches!(self.child.lock().unwrap().try_wait(), Ok(None)) {
                 return true;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(20)));
         }
-        false
     }
 }
 

@@ -1,4 +1,4 @@
-use super::{on_ui, Controller};
+use super::{on_ui, with_controller, Controller};
 use crate::cores::core_for_platform;
 use crate::paths;
 use crate::play::CoreIdentity;
@@ -41,23 +41,79 @@ pub(super) fn version_key(rom_id: i64) -> String {
     format!("core_version:{rom_id}")
 }
 
-async fn sync_game(
+pub(super) async fn sync_game(
     client: &Client,
     store: &Mutex<Store>,
     device_id: &str,
     game: &GameSaves,
     core_version: Option<&str>,
 ) -> Result<SramOutcome, Error> {
-    let last = store.lock().unwrap().in_game_save_record(game.rom_id);
-    let sram = saves::sync_sram(client, device_id, game, last.as_ref()).await?;
-    saves::remember_outcome(store, game, &sram);
-    if let Some(version) = core_version {
-        saves::sync_states(client, store, game, version).await?;
+    let result = async {
+        let last = store.lock().unwrap().in_game_save_record(game.rom_id);
+        let sram = saves::sync_sram(client, device_id, game, last.as_ref()).await?;
+        saves::remember_outcome(store, game, &sram);
+        if !matches!(sram, SramOutcome::Conflict(_)) {
+            if core_version.is_none() && crate::cores::saves_states(&game.emulator) {
+                return Err(Error::Decode(
+                    "the core version is needed to sync save states".into(),
+                ));
+            }
+            if let Some(version) = core_version {
+                saves::sync_states(client, store, game, version).await?;
+            }
+        }
+        Ok(sram)
     }
-    Ok(sram)
+    .await;
+    let mut store = store.lock().unwrap();
+    match &result {
+        Ok(SramOutcome::Conflict(_)) | Err(_) => store.add_pending(game.rom_id),
+        Ok(_) => store.remove_pending(game.rom_id),
+    }
+    result
 }
 
 impl Controller {
+    pub(super) fn finish_save_sync(&self) {
+        let stopped = self
+            .running
+            .borrow()
+            .as_ref()
+            .is_some_and(crate::play::RunningGame::stop_core);
+        if stopped {
+            self.running.borrow_mut().take();
+            let detail = self.playing.borrow_mut().take();
+            if let Some(detail) = detail {
+                self.after_play(detail, None);
+            }
+        }
+        let task = self.save_task.borrow_mut().take();
+        if let Some(task) = task {
+            // Keep the runtime alive for the current upload. If offline or too slow, the
+            // durable queue remains and retries on the next launch.
+            if self
+                .shared
+                .rt
+                .block_on(async {
+                    tokio::time::timeout(std::time::Duration::from_secs(10), task).await
+                })
+                .is_err()
+            {
+                tracing::warn!("save sync is still pending at shutdown; it will retry next launch");
+            }
+        }
+    }
+
+    pub(super) fn start_save_retry(&self) {
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_secs(30),
+            || with_controller(|c| c.sync_pending()),
+        );
+        *self.save_retry.borrow_mut() = Some(timer);
+    }
+
     pub(super) fn sync_device(&self) -> Option<String> {
         let store = self.shared.store.lock().unwrap();
         let scopes = store.get("scopes")?;
@@ -161,13 +217,28 @@ impl Controller {
         let conflict = pending.conflict.clone();
         let store = self.shared.store.clone();
         self.shared.rt.spawn(async move {
-            let result = saves::resolve_sram(&client, &device, &game, &conflict, keep).await;
-            if let Ok(outcome) = &result {
-                saves::remember_outcome(&store, &game, outcome);
+            let result = async {
+                let outcome = saves::resolve_sram(&client, &device, &game, &conflict, keep).await?;
+                saves::remember_outcome(&store, &game, &outcome);
+                let version = store.lock().unwrap().get(&version_key(game.rom_id));
+                sync_game(&client, &store, &device, &game, version.as_deref()).await
             }
+            .await;
             on_ui(move |c| {
-                if let Err(e) = result {
-                    tracing::warn!("resolving save conflict: {e}");
+                match result {
+                    Err(e) => {
+                        tracing::warn!("resolving save conflict: {e}");
+                        c.preparing.set(false);
+                        c.game_status(pending.detail.id, tr!("Couldn't sync saves: {e}.", e));
+                        return;
+                    }
+                    Ok(SramOutcome::Conflict(conflict)) => {
+                        return c.show_conflict(PendingLaunch {
+                            conflict,
+                            ..pending
+                        });
+                    }
+                    Ok(_) => {}
                 }
                 c.start_game(pending.detail, pending.rom, pending.jit, pending.core);
             });
@@ -185,6 +256,8 @@ impl Controller {
         let Some(game) = self.game_saves(&detail) else {
             return;
         };
+        // Persist before starting network work: quitting the app mid-upload must not forget it.
+        self.shared.store.lock().unwrap().add_pending(detail.id);
         let Some(device) = self.sync_device() else {
             self.shared.store.lock().unwrap().add_pending(detail.id);
             return self.game_status(
@@ -204,13 +277,21 @@ impl Controller {
             );
         };
         let store = self.shared.store.clone();
-        let version = identity.map(|(_, v)| v);
+        let version = identity.map(|(_, v)| v).or_else(|| {
+            self.shared
+                .store
+                .lock()
+                .unwrap()
+                .get(&version_key(detail.id))
+        });
         let id = detail.id;
         self.syncing_game.set(Some(id));
-        self.shared.rt.spawn(async move {
+        self.game_status(id, tr!("Syncing your saves…"));
+        let task = self.shared.rt.spawn(async move {
             let result = sync_game(&client, &store, &device, &game, version.as_deref()).await;
             on_ui(move |c| c.after_play_synced(id, result));
         });
+        *self.save_task.borrow_mut() = Some(task);
     }
 
     fn after_play_synced(&self, id: i64, result: Result<SramOutcome, Error>) {
@@ -226,7 +307,7 @@ impl Controller {
             }
             Err(e) => {
                 tracing::warn!("syncing saves for {id}: {e}");
-                tr!("Couldn't sync saves: {e}.", e)
+                tr!("Couldn't sync saves: {e}. Will retry automatically.", e)
             }
         };
         self.game_status(id, status);
@@ -236,6 +317,15 @@ impl Controller {
     }
 
     pub(super) fn sync_pending(&self) {
+        self.sync_idle_saves(false);
+    }
+
+    /// Refresh the selected game's saves as well as uploads left over from earlier sessions.
+    pub(super) fn refresh_game_saves(&self) {
+        self.sync_idle_saves(true);
+    }
+
+    fn sync_idle_saves(&self, include_current: bool) {
         let busy = self.running.borrow().is_some()
             || self.preparing.get()
             || self.syncing_game.get().is_some();
@@ -243,14 +333,18 @@ impl Controller {
         else {
             return;
         };
-        if busy {
+        if busy || self.offline.get() {
             return;
         }
-        let jobs: Vec<(GameSaves, Option<String>)> = {
+        let jobs: Vec<(GameSaves, Option<String>, Option<PathBuf>)> = {
             let store = self.shared.store.lock().unwrap();
-            store
-                .pending()
-                .into_iter()
+            let mut ids = store.pending();
+            if let Some(id) = include_current.then(|| self.current_game_id()).flatten() {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            ids.into_iter()
                 .filter_map(|id| {
                     let detail = store.game(id)?;
                     Some((detail, store.get(&version_key(id))))
@@ -258,30 +352,210 @@ impl Controller {
                 .collect::<Vec<_>>()
         }
         .into_iter()
-        .filter_map(|(detail, version)| Some((self.game_saves(&detail)?, version)))
+        .filter_map(|(detail, version)| {
+            let core = core_for_platform(&detail.platform_slug)?;
+            let installed = self.shared.cores.installed(core);
+            // Nothing can resume yet until a core is installed; the launch path will check it.
+            if version.is_none() && installed.is_none() && include_current {
+                return None;
+            }
+            Some((self.game_saves(&detail)?, version, installed))
+        })
         .collect();
         if jobs.is_empty() {
             return;
         }
+        // One save operation at a time. In particular, never replace files under a running core.
+        self.syncing_game.set(Some(jobs[0].0.rom_id));
         let store: Arc<Mutex<Store>> = self.shared.store.clone();
-        self.shared.rt.spawn(async move {
-            for (game, version) in jobs {
-                match sync_game(&client, &store, &device, &game, version.as_deref()).await {
-                    Ok(_) => store.lock().unwrap().remove_pending(game.rom_id),
-                    Err(Error::Unreachable) => {}
-                    Err(e) => {
-                        tracing::warn!("pending save sync for {}: {e}", game.rom_id);
-                        store.lock().unwrap().remove_pending(game.rom_id);
+        let task = self.shared.rt.spawn(async move {
+            let mut results = Vec::new();
+            for (game, mut version, installed) in jobs {
+                if version.is_none() && crate::cores::saves_states(&game.emulator) {
+                    if let Some(core) = installed {
+                        match crate::session::core_version(&core).await {
+                            Ok(found) => {
+                                store.lock().unwrap().set(&version_key(game.rom_id), &found);
+                                version = Some(found);
+                            }
+                            Err(e) => tracing::warn!("reading the core version: {e:#}"),
+                        }
                     }
                 }
+                let result = sync_game(&client, &store, &device, &game, version.as_deref()).await;
+                results.push((game.rom_id, result));
             }
+            on_ui(move |c| {
+                for (id, result) in results {
+                    c.after_play_synced(id, result);
+                }
+            });
         });
+        *self.save_task.borrow_mut() = Some(task);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::romm::client::tests::base_of;
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn game(dir: &std::path::Path) -> GameSaves {
+        GameSaves {
+            rom_id: 5027,
+            dir: dir.to_owned(),
+            title: "Super Mario World".into(),
+            emulator: "snes9x".into(),
+            save_file: saves::SRAM_FILE.into(),
+            save_emulator: "snes9x".into(),
+        }
+    }
+
+    async fn no_sram(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/api/saves"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn prelaunch_sync_waits_for_the_phone_state_even_when_no_battery_save_exists() {
+        let server = MockServer::start().await;
+        no_sram(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/states"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "id": 31, "rom_id": 5027, "emulator": "snes9x",
+                "file_name": "Super Mario World [2026-11-06_00-14-31].autosave.state.auto",
+                "updated_at": "2026-11-06T00:21:21Z"
+            }])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/states/31/content"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"phone progress"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Mutex::new(Store::open_in_memory().unwrap());
+        store.lock().unwrap().add_pending(5027);
+        let client = Client::new(base_of(&server, "/")).with_token("test".into());
+        sync_game(&client, &store, "device", &game(dir.path()), Some("1.63"))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("auto.state")).unwrap(),
+            b"phone progress"
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .state_record(5027, "auto")
+                .unwrap()
+                .remote_id,
+            Some(31)
+        );
+        assert!(store.lock().unwrap().pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_state_sync_survives_restart_and_only_success_clears_the_queue() {
+        let server = MockServer::start().await;
+        no_sram(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/states"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("romp.db");
+        let store = Mutex::new(Store::open(&db).unwrap());
+        let client = Client::new(base_of(&server, "/")).with_token("test".into());
+        assert!(matches!(
+            sync_game(&client, &store, "device", &game(dir.path()), Some("1.63")).await,
+            Err(Error::Status(503))
+        ));
+        drop(store);
+        let store = Mutex::new(Store::open(&db).unwrap());
+        assert_eq!(store.lock().unwrap().pending(), [5027]);
+        server.reset().await;
+        no_sram(&server).await;
+        Mock::given(method("GET"))
+            .and(path("/api/states"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        sync_game(&client, &store, "device", &game(dir.path()), Some("1.63"))
+            .await
+            .unwrap();
+        assert!(store.lock().unwrap().pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn battery_conflict_stays_pending_and_does_not_replace_states() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/saves"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+                "id": 16, "rom_id": 5027, "emulator": "snes9x", "slot": "autosave",
+                "file_name": "Super Mario World.srm", "updated_at": "2026-11-06T09:00:00Z",
+                "content_hash": "different"
+            }])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/states"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(saves::SRAM_FILE), b"local save").unwrap();
+        std::fs::write(dir.path().join("auto.state"), b"local state").unwrap();
+        let store = Mutex::new(Store::open_in_memory().unwrap());
+        let client = Client::new(base_of(&server, "/")).with_token("test".into());
+        assert!(matches!(
+            sync_game(&client, &store, "device", &game(dir.path()), Some("1.63"))
+                .await
+                .unwrap(),
+            SramOutcome::Conflict(_)
+        ));
+        assert_eq!(store.lock().unwrap().pending(), [5027]);
+        assert_eq!(
+            std::fs::read(dir.path().join("auto.state")).unwrap(),
+            b"local state"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_core_metadata_does_not_discard_a_pending_state_upload() {
+        let server = MockServer::start().await;
+        no_sram(&server).await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auto.state"), b"unsent progress").unwrap();
+        let store = Mutex::new(Store::open_in_memory().unwrap());
+        store.lock().unwrap().add_pending(5027);
+        let client = Client::new(base_of(&server, "/")).with_token("test".into());
+        assert!(
+            sync_game(&client, &store, "device", &game(dir.path()), None)
+                .await
+                .is_err()
+        );
+        assert_eq!(store.lock().unwrap().pending(), [5027]);
+        assert_eq!(
+            std::fs::read(dir.path().join("auto.state")).unwrap(),
+            b"unsent progress"
+        );
+    }
 
     #[test]
     fn conflict_text_names_both_times() {

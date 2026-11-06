@@ -91,6 +91,14 @@ fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("--probe-vulkan") {
         std::process::exit(if hw_vulkan::probe() { 0 } else { 1 });
     }
+    if std::env::args().nth(1).as_deref() == Some("--core-version") {
+        let path = std::env::args_os().nth(2).context("missing core path")?;
+        // Read metadata before initialization or loading a game. A broken core stays isolated
+        // in the runner, just as it does during play.
+        let core = unsafe { lr::Core::load(std::path::Path::new(&path)) }?;
+        println!("{}", core.system_info().library_version);
+        return Ok(());
+    }
     let args = Args::parse();
     lr::set_core_log_min(core_log_min(std::env::var("RUST_LOG").ok().as_deref()));
     #[cfg(windows)]
