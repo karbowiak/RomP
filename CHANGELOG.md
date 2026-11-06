@@ -6,7 +6,7 @@ All notable changes to Romp are listed here. The format follows [Keep a Changelo
 
 ### Fixed
 
-- Save states sync with Argosy using its timestamped auto-save and numbered-slot filenames. RomP still reads its existing core/version-specific states, keeps different cores and named playthrough channels separate, and picks the newest compatible state by its original write time.
+- Save states sync with Argosy using its timestamped auto-save and numbered-slot filenames. RomP still reads its existing core/version-specific states, keeps different cores and named playthrough channels separate, and notices newer state contents even when another client reuses an older filename.
 
 ### Added
 

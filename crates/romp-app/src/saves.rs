@@ -816,9 +816,14 @@ fn shared_state_parts(name: &str) -> Option<(&str, &str, i64)> {
 }
 
 fn state_written_at(state: &crate::romm::types::RemoteState) -> Option<i64> {
+    // Argosy can update the bytes under an existing timestamped filename. RomM's
+    // updated_at tracks writes to those bytes; native renames preserve it.
+    let updated = crate::sync::parse_iso(&state.updated_at);
     shared_state_parts(&state.file_name)
         .map(|(_, _, at)| at)
-        .or_else(|| crate::sync::parse_iso(&state.updated_at))
+        .into_iter()
+        .chain(updated)
+        .max()
 }
 
 fn state_revision(state: &crate::romm::types::RemoteState) -> String {
@@ -2008,7 +2013,7 @@ mod tests {
         }
 
         #[test]
-        fn state_recency_uses_the_write_time_instead_of_a_later_rescan() {
+        fn a_state_updated_under_its_old_filename_is_still_the_newest() {
             let states = vec![
                 serde_json::from_value(state_json(
                     3,
@@ -2027,8 +2032,59 @@ mod tests {
                 newest_state(&states, &game(Path::new("/saves")), "auto", "1.63")
                     .unwrap()
                     .id,
-                4
+                3
             );
+        }
+
+        #[tokio::test]
+        async fn newer_phone_bytes_under_an_old_name_win_over_an_older_local_change() {
+            let server = MockServer::start().await;
+            remote(
+                &server,
+                json!([state_json(
+                    3,
+                    "Zelda [2026-11-05_09-00-00].state.auto",
+                    "2026-11-06T11:00:00Z"
+                )]),
+            )
+            .await;
+            Mock::given(method("GET"))
+                .and(path("/api/states/3/content"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"PHONE_NEW".to_vec()))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/states"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("auto.state");
+            std::fs::write(&path, b"MAC_OLD").unwrap();
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(at("2026-11-06T10:00:00Z"))
+                .unwrap();
+            let store = store();
+            store.lock().unwrap().set_state_record(
+                5,
+                "auto",
+                &StateRecord {
+                    local_md5: md5_hex(b"BASE"),
+                    remote_id: Some(3),
+                    remote_updated_at: Some("2026-11-05T09:00:00Z".into()),
+                },
+            );
+            assert_eq!(
+                sync_states(&client(&server), &store, &game(dir.path()), "1.63")
+                    .await
+                    .unwrap()
+                    .downloaded,
+                1
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"PHONE_NEW");
         }
 
         #[tokio::test]
