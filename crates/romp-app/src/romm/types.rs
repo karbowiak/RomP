@@ -364,6 +364,10 @@ pub struct RemoteState {
     pub file_name: String,
     pub updated_at: String,
     #[serde(default)]
+    pub emulator: Option<String>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default)]
     pub screenshot: Option<RemoteScreenshot>,
 }
 

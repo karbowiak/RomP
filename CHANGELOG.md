@@ -4,6 +4,10 @@ All notable changes to Romp are listed here. The format follows [Keep a Changelo
 
 ## [Unreleased]
 
+### Fixed
+
+- Save states sync with Argosy using its timestamped auto-save and numbered-slot filenames. RomP still reads its existing core/version-specific states, keeps different cores and named playthrough channels separate, and picks the newest compatible state by its original write time.
+
 ### Added
 
 - A game with several versions in RomM (regions, revisions, demos, translations) shows once in the library, as the version RomM picks, with the number of versions on its tile. Its page lists the others, and choosing one makes it your main version in RomM too, so the website and your other devices show it. Saves, states and play history stay with each version. ([#39](https://github.com/RompEmu/RomP/issues/39))

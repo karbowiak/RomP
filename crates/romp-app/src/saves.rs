@@ -730,6 +730,158 @@ pub struct StateReport {
     pub downloaded: usize,
 }
 
+/// Argosy and RetroArch number manual slots from zero; RomP numbers them from one.
+fn shared_state_extension(slot: &str) -> Option<String> {
+    if slot == "auto" {
+        return Some("state.auto".into());
+    }
+    let number = slot.strip_prefix("slot-")?.parse::<usize>().ok()?;
+    (1..STATE_SLOTS.len())
+        .contains(&number)
+        .then(|| format!("state{}", number - 1))
+}
+
+/// Keep core/version information in the base name, before the timestamp and slot suffix
+/// other clients understand. The timestamp is when the state was written, in UTC.
+fn shared_state_name(game: &GameSaves, slot: &str, version: &str, at: SystemTime) -> String {
+    let date = crate::sync::iso_utc(at);
+    let timestamp = date[..19].replace('T', "_").replace(':', "-");
+    let suffix = format!(
+        " (RomP {} {}) [{}].{}",
+        clean(&game.emulator),
+        clean(version),
+        timestamp,
+        shared_state_extension(slot).expect("a RomP save slot")
+    );
+    let mut title: String = game
+        .title
+        .chars()
+        .map(|c| {
+            if c.is_control() || "/\\:|*?\"<>+".contains(c) {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .into();
+    if title.is_empty() {
+        title = "game".into();
+    }
+    while title.len() + suffix.len() > 255 && !title.is_empty() {
+        title.pop();
+    }
+    format!("{title}{suffix}")
+}
+
+/// Parse only the default state channel. A named Argosy channel belongs to a different
+/// playthrough and must never silently replace this game's default states.
+fn shared_state_parts(name: &str) -> Option<(&str, &str, i64)> {
+    let (prefix, extension) = name.rsplit_once(".state")?;
+    if extension != ".auto"
+        && (extension.is_empty() || !extension.bytes().all(|c| c.is_ascii_digit()))
+    {
+        return None;
+    }
+    let (base, timestamp) = prefix.rsplit_once(" [")?;
+    let timestamp = timestamp.strip_suffix(']')?;
+    let bytes = timestamp.as_bytes();
+    if !matches!(bytes.len(), 19 | 23) {
+        return None;
+    }
+    for (index, byte) in bytes.iter().enumerate() {
+        let valid = match index {
+            4 | 7 | 13 | 16 | 19 => *byte == b'-',
+            10 => matches!(*byte, b'_' | b' '),
+            _ => byte.is_ascii_digit(),
+        };
+        if !valid {
+            return None;
+        }
+    }
+    let iso = format!(
+        "{}T{}:{}:{}{}Z",
+        &timestamp[..10],
+        &timestamp[11..13],
+        &timestamp[14..16],
+        &timestamp[17..19],
+        if bytes.len() == 23 {
+            format!(".{}", &timestamp[20..])
+        } else {
+            String::new()
+        }
+    );
+    Some((base, extension, crate::sync::parse_iso(&iso)?))
+}
+
+fn state_written_at(state: &crate::romm::types::RemoteState) -> Option<i64> {
+    shared_state_parts(&state.file_name)
+        .map(|(_, _, at)| at)
+        .or_else(|| crate::sync::parse_iso(&state.updated_at))
+}
+
+fn state_revision(state: &crate::romm::types::RemoteState) -> String {
+    // Renaming a state preserves updated_at in RomM. A promoted timestamp still needs
+    // to invalidate an older cached slot, even when the server id has not changed.
+    if let Some((_, _, written)) = shared_state_parts(&state.file_name) {
+        if crate::sync::parse_iso(&state.updated_at).is_none_or(|updated| written > updated) {
+            let time = UNIX_EPOCH + std::time::Duration::from_millis(written.max(0) as u64);
+            return crate::sync::iso_utc(time);
+        }
+    }
+    state.updated_at.clone()
+}
+
+fn matches_state_slot(
+    state: &crate::romm::types::RemoteState,
+    game: &GameSaves,
+    slot: &str,
+    version: &str,
+) -> bool {
+    if state.rom_id != game.rom_id {
+        return false;
+    }
+    if state
+        .emulator
+        .as_deref()
+        .is_some_and(|core| core != game.emulator)
+    {
+        return false;
+    }
+    if state.file_name == state_remote_name(slot, &game.emulator, version) {
+        return true;
+    }
+    // A foreign filename contains no trustworthy core identity; require RomM's metadata.
+    if state.emulator.as_deref() != Some(game.emulator.as_str()) {
+        return false;
+    }
+    let Some((base, extension, _)) = shared_state_parts(&state.file_name) else {
+        return false;
+    };
+    if let Some((_, identity)) = base.rsplit_once(" (RomP ") {
+        if identity.strip_suffix(')')
+            != Some(format!("{} {}", clean(&game.emulator), clean(version)).as_str())
+        {
+            return false;
+        }
+    }
+    shared_state_extension(slot)
+        .is_some_and(|expected| expected.strip_prefix("state") == Some(extension))
+}
+
+fn newest_state<'a>(
+    remote: &'a [crate::romm::types::RemoteState],
+    game: &GameSaves,
+    slot: &str,
+    version: &str,
+) -> Option<&'a crate::romm::types::RemoteState> {
+    remote
+        .iter()
+        .filter(|state| matches_state_slot(state, game, slot, version))
+        .max_by_key(|state| (state_written_at(state).unwrap_or(i64::MIN), state.id))
+}
+
 pub async fn sync_states(
     client: &Client,
     store: &std::sync::Mutex<crate::store::Store>,
@@ -742,8 +894,7 @@ pub async fn sync_states(
     for slot in STATE_SLOTS {
         let file = format!("{slot}.state");
         let path = game.dir.join(&file);
-        let name = state_remote_name(slot, &game.emulator, core_version);
-        let server = remote.iter().find(|r| r.file_name == name);
+        let server = newest_state(&remote, game, slot, core_version);
         let local = std::fs::read(&path).ok();
         let record = store.lock().unwrap().state_record(game.rom_id, slot);
         if let Some(deleted) = record
@@ -752,9 +903,16 @@ pub async fn sync_states(
         {
             let forget = match server {
                 Some(srv)
-                    if deleted.remote_updated_at.as_deref() == Some(srv.updated_at.as_str()) =>
+                    if deleted.remote_id == Some(srv.id)
+                        && deleted.remote_updated_at.as_deref()
+                            == Some(state_revision(srv).as_str()) =>
                 {
-                    client.delete_states(&[srv.id]).await?;
+                    let ids: Vec<_> = remote
+                        .iter()
+                        .filter(|s| matches_state_slot(s, game, slot, core_version))
+                        .map(|s| s.id)
+                        .collect();
+                    client.delete_states(&ids).await?;
                     true
                 }
                 // Saved on another device since, so it comes down below rather than being lost.
@@ -770,15 +928,20 @@ pub async fn sync_states(
         let local_changed =
             local_md5.is_some() && record.as_ref().map(|r| &r.local_md5) != local_md5.as_ref();
         let remote_changed = server.is_some_and(|srv| {
-            record.as_ref().and_then(|r| r.remote_updated_at.as_deref())
-                != Some(srv.updated_at.as_str())
+            record.as_ref().and_then(|r| r.remote_id) != Some(srv.id)
+                || record.as_ref().and_then(|r| r.remote_updated_at.as_deref())
+                    != Some(state_revision(srv).as_str())
+                || srv
+                    .content_hash
+                    .as_ref()
+                    .is_some_and(|hash| record.as_ref().map(|r| &r.local_md5) != Some(hash))
         });
         let upload = match (local_changed, remote_changed) {
             (true, false) => true,
             (false, true) => false,
             (true, true) => {
                 let local_time = file_iso_mtime(&path).and_then(|t| crate::sync::parse_iso(&t));
-                let server_time = server.and_then(|s| crate::sync::parse_iso(&s.updated_at));
+                let server_time = server.and_then(state_written_at);
                 local_time.unwrap_or(i64::MIN) > server_time.unwrap_or(i64::MIN)
             }
             (false, false) => continue,
@@ -790,6 +953,10 @@ pub async fn sync_states(
             }
             let bytes = local.expect("local state to upload");
             let md5 = md5_hex(&bytes);
+            let saved_at = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .unwrap_or_else(|_| SystemTime::now());
+            let name = shared_state_name(game, slot, core_version, saved_at);
             let picture_name = format!("{slot}.png");
             let picture = std::fs::read(game.dir.join(&picture_name))
                 .ok()
@@ -801,7 +968,7 @@ pub async fn sync_states(
             crate::store::StateRecord {
                 local_md5: md5,
                 remote_id: Some(saved.id),
-                remote_updated_at: Some(saved.updated_at),
+                remote_updated_at: Some(state_revision(&saved)),
             }
         } else {
             let srv = server.expect("remote state to download");
@@ -823,7 +990,7 @@ pub async fn sync_states(
             crate::store::StateRecord {
                 local_md5: md5_hex(&bytes),
                 remote_id: Some(srv.id),
-                remote_updated_at: Some(srv.updated_at.clone()),
+                remote_updated_at: Some(state_revision(srv)),
             }
         };
         store
@@ -1774,6 +1941,277 @@ mod tests {
 
         fn store() -> Mutex<Store> {
             Mutex::new(Store::open_in_memory().unwrap())
+        }
+
+        fn at(iso: &str) -> SystemTime {
+            UNIX_EPOCH
+                + std::time::Duration::from_millis(crate::sync::parse_iso(iso).unwrap() as u64)
+        }
+
+        #[test]
+        fn shared_names_keep_core_versions_and_use_argosy_slots() {
+            let g = game(Path::new("/saves"));
+            for (slot, suffix) in [
+                ("auto", ".state.auto"),
+                ("slot-1", ".state0"),
+                ("slot-5", ".state4"),
+            ] {
+                let name = shared_state_name(&g, slot, "1.63", at("2026-11-06T01:02:03Z"));
+                assert_eq!(
+                    name,
+                    format!("Zelda (RomP snes9x 1-63) [2026-11-06_01-02-03]{suffix}")
+                );
+                let state = serde_json::from_value(state_json(3, &name, "t")).unwrap();
+                assert!(matches_state_slot(&state, &g, slot, "1.63"));
+                assert!(!matches_state_slot(&state, &g, slot, "1.62"));
+            }
+            let long = GameSaves {
+                title: "世界/".repeat(100),
+                ..g
+            };
+            let name = shared_state_name(&long, "auto", "1.63", UNIX_EPOCH);
+            assert!(name.len() <= 255);
+            assert!(!name.contains('/'));
+        }
+
+        #[test]
+        fn argosy_states_require_the_same_rom_and_core_and_the_default_channel() {
+            let g = game(Path::new("/saves"));
+            let name = "Zelda [2026-11-06_01-02-03-456].state0";
+            let mut json = state_json(3, name, "t");
+            let state = serde_json::from_value(json.clone()).unwrap();
+            assert!(matches_state_slot(&state, &g, "slot-1", "1.63"));
+            assert!(!matches_state_slot(&state, &g, "auto", "1.63"));
+            assert_eq!(
+                state_written_at(&state),
+                crate::sync::parse_iso("2026-11-06T01:02:03.456Z")
+            );
+            for (field, value) in [
+                ("emulator", json!("bsnes")),
+                ("emulator", json!(null)),
+                ("rom_id", json!(99)),
+            ] {
+                let mut wrong = json.clone();
+                wrong[field] = value;
+                let state = serde_json::from_value(wrong).unwrap();
+                assert!(!matches_state_slot(&state, &g, "slot-1", "1.63"));
+            }
+            for name in [
+                "Zelda [2026-11-06_01-02-03].challenge.state0",
+                "Zelda [2026-11-06_01-02-03].state99",
+                "Zelda [bad].state0",
+            ] {
+                json["file_name"] = json!(name);
+                let state = serde_json::from_value(json.clone()).unwrap();
+                assert!(!matches_state_slot(&state, &g, "slot-1", "1.63"));
+            }
+        }
+
+        #[test]
+        fn state_recency_uses_the_write_time_instead_of_a_later_rescan() {
+            let states = vec![
+                serde_json::from_value(state_json(
+                    3,
+                    "Zelda [2026-11-05_09-00-00].state.auto",
+                    "2026-11-07T00:00:00Z",
+                ))
+                .unwrap(),
+                serde_json::from_value(state_json(
+                    4,
+                    "Zelda [2026-11-06_09-00-00].state.auto",
+                    "2026-11-06T09:00:00Z",
+                ))
+                .unwrap(),
+            ];
+            assert_eq!(
+                newest_state(&states, &game(Path::new("/saves")), "auto", "1.63")
+                    .unwrap()
+                    .id,
+                4
+            );
+        }
+
+        #[tokio::test]
+        async fn a_renamed_state_is_seen_even_with_the_same_server_id_and_updated_at() {
+            let server = MockServer::start().await;
+            remote(
+                &server,
+                json!([state_json(
+                    3,
+                    "Zelda [2026-11-06_09-00-00].state.auto",
+                    "2026-11-05T09:00:00Z"
+                )]),
+            )
+            .await;
+            Mock::given(method("GET"))
+                .and(path("/api/states/3/content"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"WORLD2".to_vec()))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("auto.state");
+            std::fs::write(&path, b"LOCAL").unwrap();
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(at("2026-11-06T08:00:00Z"))
+                .unwrap();
+            let store = store();
+            store.lock().unwrap().set_state_record(
+                5,
+                "auto",
+                &StateRecord {
+                    local_md5: md5_hex(b"BASE"),
+                    remote_id: Some(3),
+                    remote_updated_at: Some("2026-11-05T09:00:00Z".into()),
+                },
+            );
+            assert_eq!(
+                sync_states(&client(&server), &store, &game(dir.path()), "1.63")
+                    .await
+                    .unwrap()
+                    .downloaded,
+                1
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"WORLD2");
+            assert!(walkdir(dir.path().join("backup"))
+                .iter()
+                .any(|p| std::fs::read(p).unwrap() == b"LOCAL"));
+            assert_eq!(
+                sync_states(&client(&server), &store, &game(dir.path()), "1.63")
+                    .await
+                    .unwrap(),
+                StateReport::default()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_changed_content_hash_is_seen_even_with_the_same_id_and_timestamp() {
+            let server = MockServer::start().await;
+            let mut row = state_json(3, "slot-1.snes9x.1-63.state", "t1");
+            row["content_hash"] = json!(md5_hex(b"NEW"));
+            remote(&server, json!([row])).await;
+            Mock::given(method("GET"))
+                .and(path("/api/states/3/content"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"NEW".to_vec()))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("slot-1.state"), b"OLD").unwrap();
+            let store = store();
+            store.lock().unwrap().set_state_record(
+                5,
+                "slot-1",
+                &StateRecord {
+                    local_md5: md5_hex(b"OLD"),
+                    remote_id: Some(3),
+                    remote_updated_at: Some("t1".into()),
+                },
+            );
+            assert_eq!(
+                sync_states(&client(&server), &store, &game(dir.path()), "1.63")
+                    .await
+                    .unwrap()
+                    .downloaded,
+                1
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("slot-1.state")).unwrap(),
+                b"NEW"
+            );
+        }
+
+        #[tokio::test]
+        async fn argosy_and_romp_states_make_a_round_trip_without_repeated_uploads() {
+            use std::sync::Arc;
+            let server = MockServer::start().await;
+            let rows = Arc::new(Mutex::new(vec![state_json(
+                1,
+                "Zelda [2026-11-05_09-00-00].state.auto",
+                "2026-11-05T09:00:00Z",
+            )]));
+            let listed = Arc::clone(&rows);
+            Mock::given(method("GET"))
+                .and(path("/api/states"))
+                .respond_with(move |_: &wiremock::Request| {
+                    ResponseTemplate::new(200).set_body_json(listed.lock().unwrap().clone())
+                })
+                .mount(&server)
+                .await;
+            for (id, bytes) in [(1, b"PHONE1"), (3, b"PHONE2")] {
+                Mock::given(method("GET"))
+                    .and(path(format!("/api/states/{id}/content")))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            let uploaded = Arc::clone(&rows);
+            Mock::given(method("POST"))
+                .and(path("/api/states"))
+                .and(query_param("emulator", "snes9x"))
+                .respond_with(move |request: &wiremock::Request| {
+                    let body = std::str::from_utf8(&request.body).unwrap();
+                    let name = body
+                        .split("filename=\"")
+                        .nth(1)
+                        .unwrap()
+                        .split('"')
+                        .next()
+                        .unwrap();
+                    assert_eq!(
+                        name,
+                        "Zelda (RomP snes9x 1-63) [2026-11-06_09-00-00].state.auto"
+                    );
+                    assert!(body.contains("MAC"));
+                    let row = state_json(2, name, "2026-11-06T09:00:00Z");
+                    uploaded.lock().unwrap().push(row.clone());
+                    ResponseTemplate::new(200).set_body_json(row)
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+            let dir = tempfile::tempdir().unwrap();
+            let store = store();
+            let g = game(dir.path());
+            let c = client(&server);
+            assert_eq!(
+                sync_states(&c, &store, &g, "1.63")
+                    .await
+                    .unwrap()
+                    .downloaded,
+                1
+            );
+            let path = dir.path().join("auto.state");
+            assert_eq!(std::fs::read(&path).unwrap(), b"PHONE1");
+            std::fs::write(&path, b"MAC").unwrap();
+            std::fs::File::open(&path)
+                .unwrap()
+                .set_modified(at("2026-11-06T09:00:00Z"))
+                .unwrap();
+            assert_eq!(
+                sync_states(&c, &store, &g, "1.63").await.unwrap().uploaded,
+                1
+            );
+            // A different device can create a new id within the server timestamp's resolution.
+            rows.lock().unwrap().push(state_json(
+                3,
+                "Zelda [2026-11-06_09-00-01].state.auto",
+                "2026-11-06T09:00:00Z",
+            ));
+            assert_eq!(
+                sync_states(&c, &store, &g, "1.63")
+                    .await
+                    .unwrap()
+                    .downloaded,
+                1
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"PHONE2");
+            assert_eq!(
+                sync_states(&c, &store, &g, "1.63").await.unwrap(),
+                StateReport::default()
+            );
         }
 
         #[tokio::test]
