@@ -129,8 +129,6 @@ Open a game from your library to download and play it. RomP installs the emulato
 
 In-game saves and save states sync with RomM before and after you play, so you can continue on another device. If a save changed in both places, RomP asks which to keep and backs up the other.
 
-Save states also travel between RomP and Argosy when both use the same emulator core and compatible core versions. RomP reads its existing state filenames and Argosy's timestamped default-channel states; new uploads use `.state.auto` for the auto-save and `.state0` through `.state4` for its five manual slots. States from a different core or a named Argosy playthrough channel stay separate.
-
 ## Controls
 
 - Gamepads are picked up automatically: the first one joins the keyboard as player 1, and each new one becomes the next player.
