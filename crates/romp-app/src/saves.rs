@@ -784,6 +784,12 @@ fn shared_state_parts(name: &str) -> Option<(&str, &str, i64)> {
     {
         return None;
     }
+    // Argosy represents its default channel as either null or the literal
+    // "autosave". Both are the same playthrough, unlike genuinely named channels.
+    let prefix = match prefix.rsplit_once('.') {
+        Some((base, channel)) if channel.eq_ignore_ascii_case("autosave") => base,
+        _ => prefix,
+    };
     let (base, timestamp) = prefix.rsplit_once(" [")?;
     let timestamp = timestamp.strip_suffix(']')?;
     let bytes = timestamp.as_bytes();
@@ -2010,6 +2016,83 @@ mod tests {
                 let state = serde_json::from_value(json.clone()).unwrap();
                 assert!(!matches_state_slot(&state, &g, "slot-1", "1.63"));
             }
+        }
+
+        #[test]
+        fn argosys_explicit_autosave_channel_is_the_default_channel() {
+            let g = game(Path::new("/saves"));
+            for (name, slot) in [
+                (
+                    "Super Mario World [2026-11-06_00-14-31].autosave.state.auto",
+                    "auto",
+                ),
+                (
+                    "Super Mario World [2026-11-06_00-14-31].AUTOSAVE.state.auto",
+                    "auto",
+                ),
+                (
+                    "Super Mario World [2026-11-06_00-14-31].autosave.state0",
+                    "slot-1",
+                ),
+            ] {
+                let state =
+                    serde_json::from_value(state_json(31, name, "2026-11-06T00:21:21Z")).unwrap();
+                assert!(matches_state_slot(&state, &g, slot, "1.63"));
+                assert_eq!(
+                    state_written_at(&state),
+                    crate::sync::parse_iso("2026-11-06T00:21:21Z")
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn an_argosy_smw_autosave_is_downloaded_without_creating_a_fresh_state() {
+            let server = MockServer::start().await;
+            remote(
+                &server,
+                json!([state_json(
+                    31,
+                    "Super Mario World [2026-11-06_00-14-31].autosave.state.auto",
+                    "2026-11-06T00:21:21Z"
+                )]),
+            )
+            .await;
+            Mock::given(method("GET"))
+                .and(path("/api/states/31/content"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_bytes(b"LAST_NIGHTS_PROGRESS".to_vec()),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/states"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let dir = tempfile::tempdir().unwrap();
+            let store = store();
+            let report = sync_states(&client(&server), &store, &game(dir.path()), "1.63")
+                .await
+                .unwrap();
+            assert_eq!(
+                report,
+                StateReport {
+                    uploaded: 0,
+                    downloaded: 1
+                }
+            );
+            assert_eq!(
+                std::fs::read(dir.path().join("auto.state")).unwrap(),
+                b"LAST_NIGHTS_PROGRESS"
+            );
+            assert_eq!(
+                sync_states(&client(&server), &store, &game(dir.path()), "1.63")
+                    .await
+                    .unwrap(),
+                StateReport::default()
+            );
         }
 
         #[test]
